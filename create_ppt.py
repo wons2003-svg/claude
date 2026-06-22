@@ -16,12 +16,14 @@ def decode_b64_to_image(b64_data):
     img.load()
     return img
 
-def make_circular_image(img, size=400):
+def make_circular_image(img, size=400, top_ratio=0.08):
     img = img.convert("RGBA")
     w, h = img.size
     crop_size = min(w, h)
     left = (w - crop_size) // 2
-    top = (h - crop_size) // 2
+    top = int(h * top_ratio)
+    if top + crop_size > h:
+        top = h - crop_size
     img = img.crop((left, top, left + crop_size, top + crop_size))
     img = img.resize((size, size), Image.LANCZOS)
     mask = Image.new("L", (size, size), 0)
