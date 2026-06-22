@@ -56,19 +56,15 @@ def svg_to_png(svg_str, out_path, scale=4):
 with open("/home/user/claude/retirement-banner.html", "r") as f:
     html = f.read()
 
-b64_images = re.findall(r'src="data:image/jpeg;base64,([^"]+)"', html)
 svgs = re.findall(r'(<svg[^>]*>.*?</svg>)', html, re.DOTALL)
 
 names = ["김보영", "전은영", "장정원", "제경순", "최복례"]
 photos = []
-for i, b64 in enumerate(b64_images):
-    try:
-        img = decode_b64_to_image(b64)
-        photos.append(make_circular_image(img))
-        print(f"Photo {i} ({names[i]}): OK")
-    except Exception as e:
-        photos.append(make_placeholder_circle(names[i]))
-        print(f"Photo {i} ({names[i]}): placeholder - {e}")
+for i, name in enumerate(names):
+    photo_path = f"/home/user/claude/photo_{name}.jpg"
+    img = Image.open(photo_path)
+    photos.append(make_circular_image(img))
+    print(f"Photo {i} ({name}): OK from {photo_path}")
 
 svg_paths = []
 for i, svg in enumerate(svgs):
