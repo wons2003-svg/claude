@@ -16,7 +16,7 @@ def decode_b64_to_image(b64_data):
     img.load()
     return img
 
-def make_circular_image(img, size=400, top_ratio=0.08):
+def make_circular_image(img, size=400, top_ratio=0.08, inner_scale=0.82):
     img = img.convert("RGBA")
     w, h = img.size
     crop_size = min(w, h)
@@ -25,11 +25,15 @@ def make_circular_image(img, size=400, top_ratio=0.08):
     if top + crop_size > h:
         top = h - crop_size
     img = img.crop((left, top, left + crop_size, top + crop_size))
-    img = img.resize((size, size), Image.LANCZOS)
+    inner = int(size * inner_scale)
+    img = img.resize((inner, inner), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    offset = (size - inner) // 2
+    canvas.paste(img, (offset, offset))
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
     output = Image.new("RGBA", (size, size), (255, 255, 255, 0))
-    output.paste(img, (0, 0), mask)
+    output.paste(canvas, (0, 0), mask)
     border = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ImageDraw.Draw(border).ellipse((4, 4, size - 5, size - 5), outline=(224, 48, 48, 255), width=10)
     output = Image.alpha_composite(output, border)
