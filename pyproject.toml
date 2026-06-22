@@ -1,0 +1,17 @@
+[project]
+name = "hr-assistant"
+version = "0.1.0"
+description = "Claude API 기반 HR 문서 자동화 도구"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
