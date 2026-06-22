@@ -16,7 +16,7 @@ def decode_b64_to_image(b64_data):
     img.load()
     return img
 
-def make_circular_image(img, size=400, top_ratio=0.08, inner_scale=0.82):
+def make_circular_image(img, size=400, top_ratio=0.08, border_width=10):
     img = img.convert("RGBA")
     w, h = img.size
     crop_size = min(w, h)
@@ -25,18 +25,17 @@ def make_circular_image(img, size=400, top_ratio=0.08, inner_scale=0.82):
     if top + crop_size > h:
         top = h - crop_size
     img = img.crop((left, top, left + crop_size, top + crop_size))
-    inner = int(size * inner_scale)
+    inner = size - border_width * 2
     img = img.resize((inner, inner), Image.LANCZOS)
-    canvas = Image.new("RGBA", (size, size), (255, 255, 255, 255))
-    offset = (size - inner) // 2
-    canvas.paste(img, (offset, offset))
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
-    output = Image.new("RGBA", (size, size), (255, 255, 255, 0))
-    output.paste(canvas, (0, 0), mask)
-    border = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    ImageDraw.Draw(border).ellipse((4, 4, size - 5, size - 5), outline=(224, 48, 48, 255), width=10)
-    output = Image.alpha_composite(output, border)
+    inner_mask = Image.new("L", (inner, inner), 0)
+    ImageDraw.Draw(inner_mask).ellipse((0, 0, inner, inner), fill=255)
+    photo_circle = Image.new("RGBA", (inner, inner), (255, 255, 255, 0))
+    photo_circle.paste(img, (0, 0), inner_mask)
+    output = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(output)
+    draw.ellipse((0, 0, size - 1, size - 1), fill=(224, 48, 48, 255))
+    draw.ellipse((border_width, border_width, size - 1 - border_width, size - 1 - border_width), fill=(255, 255, 255, 255))
+    output.paste(photo_circle, (border_width, border_width), photo_circle)
     return output
 
 def make_placeholder_circle(name, size=400):
