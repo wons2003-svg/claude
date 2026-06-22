@@ -16,7 +16,7 @@ def decode_b64_to_image(b64_data):
     img.load()
     return img
 
-def make_square_image(img, size=400):
+def make_circular_image(img, size=400):
     img = img.convert("RGBA")
     w, h = img.size
     crop_size = min(w, h)
@@ -24,10 +24,14 @@ def make_square_image(img, size=400):
     top = (h - crop_size) // 2
     img = img.crop((left, top, left + crop_size, top + crop_size))
     img = img.resize((size, size), Image.LANCZOS)
-    border_w = 6
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([border_w//2, border_w//2, size - border_w//2 - 1, size - border_w//2 - 1], outline=(224, 48, 48, 255), width=border_w)
-    return img
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+    output = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+    output.paste(img, (0, 0), mask)
+    border = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ImageDraw.Draw(border).ellipse((4, 4, size - 5, size - 5), outline=(224, 48, 48, 255), width=10)
+    output = Image.alpha_composite(output, border)
+    return output
 
 def make_placeholder_circle(name, size=400):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -65,7 +69,7 @@ photos = []
 for i, name in enumerate(names):
     photo_path = f"/home/user/claude/photo_{name}.jpg"
     img = Image.open(photo_path)
-    photos.append(make_square_image(img))
+    photos.append(make_circular_image(img))
     print(f"Photo {i} ({name}): OK from {photo_path}")
 
 svg_paths = []
