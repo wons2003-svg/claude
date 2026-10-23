@@ -196,22 +196,58 @@ def prepare_nvidia_dlls():
         pass
 
 
+def cuda_libs_ok():
+    """Windows: pip로 설치한 cuBLAS·cuDNN DLL이 실제로 로드되는지 확인합니다.
+    GPU는 있는데 이 라이브러리가 없으면 모델은 떠도 첫 구간에서 멈추므로, 미리 알고 CPU로 가는 편이 낫습니다."""
+    if sys.platform != "win32":
+        return True
+    prepare_nvidia_dlls()
+    import ctypes
+    for name in ("cublas64_12.dll", "cudnn64_9.dll"):
+        try:
+            ctypes.WinDLL(name)
+        except OSError:
+            return False
+    return True
+
+
+DEVICE_NOTE = ""   # 장치를 자동으로 고른 이유. 창 프로그램이 상태 표시줄에 보여줍니다.
+
+
 def pick_device(device):
+    global DEVICE_NOTE
+    DEVICE_NOTE = ""
     if device != "auto":
         return device
     try:
         import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda"
+            if cuda_libs_ok():
+                return "cuda"
+            DEVICE_NOTE = ("NVIDIA GPU는 있지만 GPU 라이브러리(cuBLAS·cuDNN)가 없어 CPU로 진행합니다. "
+                           "GPU를 쓰려면:  .venv\\Scripts\\pip install -r requirements-gpu.txt")
     except Exception:
         pass
     return "cpu"
 
 
-def pick_compute(compute, device):
+def gpu_memory_mb():
+    """nvidia-smi로 GPU 메모리 크기(MB)를 읽습니다. 못 읽으면 None."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+        return int(float(r.stdout.strip().splitlines()[0]))
+    except Exception:
+        return None
+
+
+def pick_compute(compute, device, vram_mb=None):
+    """GPU 메모리가 6GB 미만(노트북 GPU 대부분)이면 int8_float16: large-v3가 float16으로는 안 들어가고, 정확도 차이는 거의 없습니다."""
     if compute != "auto":
         return compute
-    return "float16" if device == "cuda" else "int8"
+    if device == "cuda":
+        return "int8_float16" if vram_mb and vram_mb < 6000 else "float16"
+    return "int8"
 
 
 def pick_model(model, device):
@@ -219,6 +255,16 @@ def pick_model(model, device):
     if model != "auto":
         return model
     return "large-v3" if device == "cuda" else "large-v3-turbo"
+
+
+def pick_all(args):
+    """device → compute → model 순서로 자동값을 채웁니다. (명령어 도구와 창 프로그램이 같이 씁니다)"""
+    args.auto_model = args.model == "auto"      # 자동 선택이었다면 CPU로 전환될 때 모델도 CPU용으로 바꿉니다
+    args.device = pick_device(args.device)
+    args.vram_mb = gpu_memory_mb() if args.device == "cuda" else None
+    args.compute = pick_compute(args.compute, args.device, args.vram_mb)
+    args.model = pick_model(args.model, args.device)
+    return args
 
 
 def load_engine(model_name, device, compute, threads):
@@ -233,16 +279,7 @@ def load_engine(model_name, device, compute, threads):
     if device == "cpu":
         kw["cpu_threads"] = threads or max(1, os.cpu_count() or 4)
     log(f"모델 불러오는 중: {model_name} (장치 {device}, 연산 {compute}) — 처음 한 번은 모델을 내려받아 몇 분 걸립니다.")
-    try:
-        return WhisperModel(model_name, **kw)
-    except Exception as e:
-        if device != "cuda":
-            raise
-        # GPU 라이브러리(cuDNN·CUDA) 문제로 못 띄우는 경우가 잦아서, 멈추지 않고 CPU로 계속 진행합니다.
-        log(f"[안내] GPU로 모델을 띄우지 못했습니다 ({str(e).splitlines()[0][:120]})")
-        log("       CPU(int8)로 대신 진행합니다. 느리지만 결과는 같습니다. GPU를 쓰려면 README의 'GPU 관련 오류' 항목을 보세요.")
-        kw = {"device": "cpu", "compute_type": "int8", "cpu_threads": threads or max(1, os.cpu_count() or 4)}
-        return WhisperModel(model_name, **kw)
+    return WhisperModel(model_name, **kw)
 
 
 def transcribe_chunk(model, wav_path, language, prompt, beam, offset, chunk_len, progress_every=120):
@@ -351,12 +388,28 @@ class LazyEngine:
     def get(self):
         if self.model is None:
             a = self.args
-            self.model = load_engine(a.model, a.device, a.compute, a.threads)
+            try:
+                self.model = load_engine(a.model, a.device, a.compute, a.threads)
+            except Exception as e:
+                if a.device != "cuda":
+                    raise
+                # GPU 라이브러리(cuDNN·CUDA) 문제로 못 띄우는 경우가 잦아서, 멈추지 않고 CPU로 계속 진행합니다.
+                log(f"[안내] GPU로 모델을 띄우지 못했습니다 ({str(e).splitlines()[0][:120]})")
+                self.model = self.fallback_to_cpu()
         return self.model
 
     def fallback_to_cpu(self):
-        """GPU에서 첫 연산 중 실패(DLL 누락 등)하면 CPU로 갈아탑니다. 이후 파일도 CPU로 처리됩니다."""
-        self.args.device, self.args.compute, self.model = "cpu", "int8", None
+        """GPU에서 실패(DLL 누락, 메모리 부족 등)하면 CPU로 갈아탑니다. 이후 파일도 CPU로 처리됩니다.
+        모델을 '자동'으로 골랐다면 CPU에 맞는 large-v3-turbo로 바꿉니다. large-v3를 CPU에서 돌리면 2~3배 느려서
+        긴 녹음이 하룻밤을 넘깁니다. 이미 끝난 구간은 그대로 둡니다 (몇 시간 걸린 결과를 모델 때문에 버리지 않음)."""
+        a = self.args
+        a.device, a.compute, self.model = "cpu", "int8", None
+        if a.auto_model and a.model == "large-v3":
+            a.model, a.model_switched_from = "large-v3-turbo", "large-v3"
+            log("       CPU(int8)로 전환하고, 모델도 CPU용 large-v3-turbo로 바꿉니다 (자동 선택이었으므로). 이미 끝난 구간은 그대로 둡니다.")
+        else:
+            log("       CPU(int8)로 대신 진행합니다. 느리지만 결과는 같습니다.")
+        log("       GPU를 쓰려면 README의 'GPU 관련 오류' 항목을 보세요.")
         return self.get()
 
 
@@ -408,7 +461,10 @@ def process_file(src, args, ffmpeg, engine):
             shutil.rmtree(work, ignore_errors=True)   # 원본이 바뀌었거나 다시 하라고 했으니 처음부터
             plan = None
         elif plan.get("settings") != fp["settings"]:
-            log("   설정(모델·프롬프트 등)이 바뀌어 이전 구간 결과는 버리고 다시 전사합니다. (변환된 음성은 재사용)")
+            old, new = plan.get("settings", {}), fp["settings"]
+            changed = ", ".join(f"{k}: {old.get(k)} → {new[k]}" for k in new if old.get(k) != new[k])
+            log(f"   설정이 바뀌어({changed}) 이전 구간 결과는 버리고 다시 전사합니다. (변환된 음성은 재사용)")
+            log("   (이전 결과를 이어서 쓰려면 중단한 뒤 이전과 같은 설정으로 다시 실행하세요)")
             for p in work.glob("chunk_*.json"):
                 p.unlink()
             plan_path.unlink(missing_ok=True)
@@ -472,9 +528,8 @@ def process_file(src, args, ffmpeg, engine):
                 if args.device != "cuda":
                     raise
                 log(f"[안내] GPU 연산 중 오류 ({str(e).splitlines()[0][:120]})")
-                log("       CPU(int8)로 전환해 이어서 진행합니다. GPU를 쓰려면 README의 'GPU 관련 오류' 항목을 보세요.")
-                if args.model == "large-v3":
-                    log("       (CPU에서는 --model large-v3-turbo 가 훨씬 빠릅니다. 급하면 중단 후 그 옵션으로 다시 실행하세요.)")
+                if args.model == "large-v3" and not args.auto_model:
+                    log("       (CPU에서는 --model large-v3-turbo 가 2~3배 빠릅니다. 급하면 중단 후 그 옵션으로 다시 실행하세요.)")
                 model = engine.fallback_to_cpu()
                 segs = transcribe_chunk(model, cw, args.language, prompt, args.beam, a, b - a)
             write_json(cj, segs)
@@ -492,6 +547,7 @@ def process_file(src, args, ffmpeg, engine):
     meta = {
         "source": src.name, "duration_sec": round(duration, 2), "model": args.model, "language": args.language,
         "device": args.device, "prompt": args.prompt, "chunks": len(chunks),
+        "model_switched_from": getattr(args, "model_switched_from", None),   # CPU 전환으로 도중에 모델이 바뀐 경우
         "segments_raw": len(all_segs), "segments_kept": len(segs),
         "generated_by": "transcribe.py", "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -552,9 +608,7 @@ def main(argv=None):
         ap.error("--beam 은 1 이상이어야 합니다.")
     if args.language.lower() == "auto":
         args.language = None
-    args.device = pick_device(args.device)
-    args.compute = pick_compute(args.compute, args.device)
-    args.model = pick_model(args.model, args.device)
+    pick_all(args)
 
     files = collect_inputs(args.inputs)
     if not files:
@@ -562,7 +616,9 @@ def main(argv=None):
         return 1
     ffmpeg = get_ffmpeg()
     engine = LazyEngine(args)
-    log(f"대상 파일 {len(files)}개 · 모델 {args.model} · 장치 {args.device}")
+    log(f"대상 파일 {len(files)}개 · 모델 {args.model} · 장치 {args.device}" + (f" ({args.vram_mb}MB, {args.compute})" if args.vram_mb else ""))
+    if DEVICE_NOTE:
+        log(f"[안내] {DEVICE_NOTE}")
     failed = []
     for f in files:
         try:

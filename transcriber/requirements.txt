@@ -1,2 +1,4 @@
 faster-whisper>=1.1.0
+# PyAV 19에서 av.open(metadata_errors=...) 인자가 없어져 faster-whisper 1.2.1이 음성을 못 읽음
+av>=11,<19
 imageio-ffmpeg>=0.5.1

@@ -39,10 +39,7 @@ def build_args(model="auto", language="ko", prompt="", outdir="", overwrite=Fals
         chunk_min=chunk_min, beam=beam, prompt=prompt.strip(), outdir=outdir.strip().strip('"').strip("'").strip(), overwrite=overwrite,
         keep_work=False, plan_only=False,
     )
-    a.device = T.pick_device(a.device)
-    a.compute = T.pick_compute(a.compute, a.device)
-    a.model = T.pick_model(a.model, a.device)
-    return a
+    return T.pick_all(a)
 
 
 def run_jobs(files, args, emit, cancel_check):
@@ -54,6 +51,8 @@ def run_jobs(files, args, emit, cancel_check):
         ffmpeg = T.get_ffmpeg()
         engine = T.LazyEngine(args)
         emit("log", f"대상 파일 {len(files)}개 · 모델 {args.model} · 장치 {'GPU' if args.device == 'cuda' else 'CPU'}")
+        if T.DEVICE_NOTE:
+            emit("log", f"[안내] {T.DEVICE_NOTE}")
         for i, f in enumerate(files, 1):
             if cancel_check():
                 cancelled = True
@@ -162,7 +161,8 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(row, text="중지", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
         ttk.Button(row, text="결과 폴더 열기", command=self.open_outdir).pack(side="left")
-        self.status_var = tk.StringVar(value=f"준비됨 · 장치: {'GPU' if T.pick_device('auto') == 'cuda' else 'CPU'}")
+        device = T.pick_device("auto")
+        self.status_var = tk.StringVar(value=f"준비됨 · 장치: {'GPU' if device == 'cuda' else 'CPU'}" + (" (GPU 라이브러리 없음)" if T.DEVICE_NOTE else ""))
         ttk.Label(row, textvariable=self.status_var).pack(side="right")
         self.progress = ttk.Progressbar(run_box, mode="determinate", maximum=1, value=0)
         self.progress.pack(fill="x", padx=6, pady=(0, 4))
@@ -174,6 +174,8 @@ class App(tk.Tk):
         self.log.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
         self._append_log("파일을 추가하고 [전사 시작]을 누르세요. 처음 한 번은 모델(1.5~3GB)을 내려받느라 몇 분 걸립니다.")
+        if T.DEVICE_NOTE:
+            self._append_log(f"[안내] {T.DEVICE_NOTE}")
 
     # ------------------------------------------------------------ actions
     def _set_files(self, files):
