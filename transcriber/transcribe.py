@@ -590,10 +590,12 @@ def build_parser():
     ap.add_argument("--overwrite", action="store_true", help="결과·중간 파일이 있어도 처음부터 다시 전사")
     ap.add_argument("--keep-work", action="store_true", help="중간 파일(.작업중) 삭제하지 않음")
     ap.add_argument("--plan-only", action="store_true", help="모델을 띄우지 않고 변환·분할 계획만 확인")
+    ap.add_argument("--cancel-file", default="", help="이 경로에 파일이 생기면 현재 구간을 버리고 중단합니다 (창 프로그램의 [중지]용)")
     return ap
 
 
 def main(argv=None):
+    global CANCEL_CHECK
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
             try:
@@ -602,6 +604,8 @@ def main(argv=None):
                 pass
     ap = build_parser()
     args = ap.parse_args(argv)
+    if args.cancel_file:
+        CANCEL_CHECK = Path(args.cancel_file).exists   # 창 프로그램이 [중지]를 누르면 이 파일을 만듭니다
     if args.chunk_min < MIN_CHUNK_MIN:
         ap.error(f"--chunk-min 은 {MIN_CHUNK_MIN} 이상이어야 합니다.")
     if args.beam < 1:

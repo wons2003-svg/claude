@@ -2,25 +2,34 @@
 # -*- coding: utf-8 -*-
 """
 무제한 전사기 — 창(GUI) 버전
-더블클릭으로 열어서 파일을 고르고 [전사 시작]을 누르면 됩니다. 엔진은 transcribe.py와 같습니다.
+더블클릭으로 열어서 파일을 고르고 [전사 시작]을 누르면 됩니다.
+전사 자체는 transcribe.py를 별도 프로세스로 띄워서 합니다. 음성인식 엔진(C++ 라이브러리)이 오류 메시지 없이
+프로세스를 통째로 끝내는 일이 있는데, 같은 프로세스 안에서 돌리면 창까지 사라지기 때문입니다.
+그렇게 죽으면 창은 남아 있고, 완료된 구간은 저장돼 있으므로 자동으로 이어서 다시 시작합니다.
 """
 
 import os
 import queue
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
-import traceback
-import types
+import time
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import transcribe as T  # noqa: E402
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import transcribe as T  # noqa: E402  (파일 목록·장치 확인에만 씀. 전사는 별도 프로세스)
 
 APP_TITLE = "무제한 전사기"
+ENGINE_SCRIPT = HERE / "transcribe.py"
+CRASH_RETRY_MAX = 3      # 진전 없이 이 횟수만큼 다시 시작해도 또 죽으면 포기
+CRASH_RETRY_WAIT = 10    # 초. 다시 시작하기 전 대기 (GPU·메모리가 정리될 시간)
+STOP_KILL_AFTER = 20     # 초. [중지] 뒤 이 시간 안에 스스로 안 끝나면(모델 내려받기 중 등) 강제 종료
 MODEL_CHOICES = [
     ("자동 (권장: GPU면 large-v3, CPU면 large-v3-turbo)", "auto"),
     ("large-v3 (가장 정확, 느림)", "large-v3"),
@@ -32,54 +41,151 @@ LANG_CHOICES = [("한국어", "ko"), ("영어", "en"), ("자동 감지 (언어�
 FILETYPES = [("음성·영상 파일", " ".join(f"*{e}" for e in sorted(T.MEDIA_EXT))), ("모든 파일", "*.*")]
 
 
-def build_args(model="auto", language="ko", prompt="", outdir="", overwrite=False, chunk_min=20, beam=5):
-    """transcribe.py의 argparse 결과와 같은 모양의 설정 객체."""
-    a = types.SimpleNamespace(
-        model=model, language=(None if language == "auto" else language), device="auto", compute="auto", threads=0,
-        chunk_min=chunk_min, beam=beam, prompt=prompt.strip(), outdir=outdir.strip().strip('"').strip("'").strip(), overwrite=overwrite,
-        keep_work=False, plan_only=False,
-    )
-    return T.pick_all(a)
+def build_cmd(files, opts, cancel_file):
+    """transcribe.py 명령줄. 모델·언어의 '자동'은 그대로 넘겨, 장치에 맞는 선택을 transcribe.py가 하게 합니다."""
+    cmd = [sys.executable, "-u", str(ENGINE_SCRIPT), *[str(f) for f in files],
+           "--model", opts["model"], "--language", opts["language"], "--cancel-file", str(cancel_file)]
+    if opts["prompt"]:
+        cmd += ["--prompt", opts["prompt"]]
+    if opts["outdir"]:
+        cmd += ["--outdir", opts["outdir"]]
+    if opts["overwrite"]:
+        cmd.append("--overwrite")
+    return cmd
 
 
-def run_jobs(files, args, emit, cancel_check):
-    """백그라운드 스레드에서 실행. emit(kind, payload)로 창에 알리고, cancel_check()가 True면 멈춥니다."""
-    T.log = lambda msg="": emit("log", str(msg))
-    T.CANCEL_CHECK = cancel_check
-    done, failed, cancelled = 0, [], False
+def start_engine(cmd):
+    """출력을 줄 단위로 받도록 파이프로 띄웁니다. Windows는 콘솔 창이 새로 뜨지 않게, Mac/Linux는 ffmpeg까지 한 번에 끝낼 수 있게 프로세스 그룹으로."""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {"start_new_session": True}
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1, env=env, **kw)
+
+
+def kill_tree(proc):
+    """엔진과 그 아래에서 돌고 있는 ffmpeg까지 강제 종료합니다."""
+    if proc.poll() is not None:
+        return
     try:
-        ffmpeg = T.get_ffmpeg()
-        engine = T.LazyEngine(args)
-        emit("log", f"대상 파일 {len(files)}개 · 모델 {args.model} · 장치 {'GPU' if args.device == 'cuda' else 'CPU'}")
-        if T.DEVICE_NOTE:
-            emit("log", f"[안내] {T.DEVICE_NOTE}")
-        for i, f in enumerate(files, 1):
-            if cancel_check():
-                cancelled = True
-                break
-            emit("progress", (done, len(files), f.name))
-            try:
-                T.process_file(f, args, ffmpeg, engine)
-                done += 1
-                emit("outdir", str(Path(args.outdir) if args.outdir else f.parent / "전사결과"))
-            except T.Cancelled:
-                cancelled = True
-                emit("log", "\n중단됨. 다시 [전사 시작]을 누르면 완료된 구간은 건너뛰고 이어서 진행합니다.")
-                break
-            except SystemExit as e:  # faster-whisper 미설치 등: transcribe.py가 sys.exit 하는 경우
-                failed.append((f.name, f"설치 문제 (코드 {e.code})"))
-                break
-            except Exception as e:
-                failed.append((f.name, str(e)))
-                emit("log", f"[실패] {f.name}: {e}")
-                emit("log", traceback.format_exc(limit=3))
-            emit("progress", (done, len(files), f.name))
-    except SystemExit as e:
-        failed.append(("(시작 전)", f"설치 문제 (코드 {e.code})"))
-    except Exception as e:
-        failed.append(("(시작 전)", str(e)))
-        emit("log", traceback.format_exc(limit=3))
-    emit("done", {"done": done, "failed": failed, "cancelled": cancelled, "total": len(files)})
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+class Job:
+    """[전사 시작] 한 번. 백그라운드 스레드에서 transcribe.py를 별도 프로세스로 돌리고 출력을 창에 전달합니다.
+
+    종료 코드 0(완료)·1(파일 문제로 실패)·130(중단)은 transcribe.py가 스스로 끝낸 것이고, 그 외는 엔진이
+    메시지 없이 죽은 것입니다. 그러면 몇 초 뒤 아직 안 끝난 파일로 같은 설정으로 다시 시작합니다.
+    완료된 구간은 transcribe.py가 저장해 두므로 이어서 진행됩니다. 구간이 하나라도 새로 끝났으면 재시작 횟수를
+    다시 세고, 진전 없이 CRASH_RETRY_MAX번 다시 시작해도 죽으면 포기합니다 (같은 구간에서 반복되는 문제).
+    """
+
+    def __init__(self, files, opts, emit):
+        self.files, self.opts, self.emit = list(files), opts, emit
+        self.cancel = threading.Event()
+        self.proc = None
+        self.cancel_file = Path(tempfile.gettempdir()) / f"transcriber-cancel-{os.getpid()}-{int(time.time())}"
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def is_alive(self):
+        return self.thread.is_alive()
+
+    def request_stop(self, hard=False):
+        """[중지]: 취소 파일을 만들어 transcribe.py가 현재 구간을 버리고 스스로 끝내게 합니다(코드 130).
+        시간 안에 안 끝나면 강제 종료. hard=True(창 닫기)는 기다리지 않고 바로 강제 종료."""
+        self.cancel.set()
+        try:
+            self.cancel_file.touch()
+        except Exception:
+            pass
+        proc = self.proc
+        if proc is None:
+            return
+        if hard:
+            kill_tree(proc)
+        else:
+            t = threading.Timer(STOP_KILL_AFTER, kill_tree, [proc])
+            t.daemon = True
+            t.start()
+
+    def _run(self):
+        done, failed, current = {}, {}, None   # 파일 이름 → 결과. 다시 시작할 때 같은 파일이 두 번 집계되지 않게 dict
+        crashes, cancelled, overwrite = 0, False, self.opts["overwrite"]
+        remaining = list(self.files)
+        try:
+            while remaining:
+                self.cancel_file.unlink(missing_ok=True)
+                self.proc = start_engine(build_cmd(remaining, dict(self.opts, overwrite=overwrite), self.cancel_file))
+                progressed = False
+                for line in self.proc.stdout:
+                    line = line.rstrip("\r\n")
+                    self.emit("log", line)
+                    if line.startswith("=== ") and line.endswith(" ==="):
+                        current = line[4:-4]
+                        self.emit("progress", (len(done), len(self.files), current))
+                    elif line.startswith("4) 완료 →"):
+                        done[current] = True
+                        progressed = True
+                        try:
+                            self.emit("outdir", str(Path(line.split("→", 1)[1].split("  (+")[0].strip()).parent))
+                        except Exception:
+                            pass
+                        self.emit("progress", (len(done), len(self.files), current))
+                    elif line.startswith("건너뜀 ("):
+                        name = line.rsplit(": ", 1)[-1]
+                        done[name] = True
+                        self.emit("progress", (len(done), len(self.files), name))
+                    elif "완료 · 처리 속도" in line:
+                        progressed = True     # 구간 하나가 저장됨 → 다음에 죽으면 재시작 횟수를 새로 셉니다
+                    elif line.startswith("[실패] "):
+                        name, _, err = line[len("[실패] "):].partition(": ")
+                        failed[name] = err
+                code = self.proc.wait()
+                if self.cancel.is_set():
+                    cancelled = True
+                    break
+                if code in (0, 1, 130):       # transcribe.py가 스스로 끝낸 경우. 할 말은 이미 출력했음
+                    cancelled = code == 130
+                    break
+                # 여기부터는 엔진이 메시지 없이 죽은 경우
+                crashes = 1 if progressed else crashes + 1
+                remaining = [f for f in self.files if f.name not in done and f.name not in failed]
+                overwrite = False     # '처음부터 다시'를 재시작 때 또 적용하면 저장된 구간을 버리므로 끕니다
+                if crashes > CRASH_RETRY_MAX or not remaining:
+                    self.emit("log", f"\n[실패] 엔진이 계속 강제 종료됩니다 (코드 {code}). {CRASH_RETRY_MAX}번 다시 시작했지만 진전이 없어 멈춥니다. "
+                                     "완료된 구간은 저장되어 있습니다. 같은 구간에서 반복되면 다른 모델(large-v3-turbo·medium)로 시도해 보세요.")
+                    if current:
+                        failed.setdefault(current, f"엔진 강제 종료 반복 (코드 {code})")
+                    break
+                self.emit("log", f"\n[안내] 엔진이 예기치 않게 종료됐습니다 (코드 {code}). 완료된 구간은 저장되어 있으니 "
+                                 f"{CRASH_RETRY_WAIT}초 후 이어서 다시 시작합니다. ({crashes}/{CRASH_RETRY_MAX})")
+                self.emit("status", f"엔진 다시 시작 대기 중… ({crashes}/{CRASH_RETRY_MAX})")
+                for _ in range(CRASH_RETRY_WAIT * 2):
+                    if self.cancel.is_set():
+                        break
+                    time.sleep(0.5)
+                if self.cancel.is_set():
+                    cancelled = True
+                    break
+        except Exception as e:      # 엔진을 띄우지 못한 경우 등
+            self.emit("log", f"[실패] 엔진을 실행할 수 없습니다: {e}")
+            failed.setdefault("(시작 전)", str(e))
+        finally:
+            self.cancel_file.unlink(missing_ok=True)
+        if cancelled:
+            self.emit("log", "\n중단됨. 다시 [전사 시작]을 누르면 완료된 구간은 건너뛰고 이어서 진행합니다.")
+        self.emit("done", {"done": len(done), "failed": list(failed.items()), "cancelled": cancelled, "total": len(self.files)})
 
 
 class App(tk.Tk):
@@ -89,8 +195,7 @@ class App(tk.Tk):
         self.scale = max(1.0, self.winfo_fpixels("1i") / 96.0)   # 고해상도(125%, 150%…) 화면 배율
         self.files = []
         self.q = queue.Queue()
-        self.worker = None
-        self.cancel = threading.Event()
+        self.job = None
         self.last_outdir = None
         self._build()
         # 창 크기는 배율에 맞춰 내용이 다 보이는 크기로 (고정 픽셀값을 쓰면 150% 화면에서 아래가 잘림)
@@ -216,32 +321,34 @@ class App(tk.Tk):
         if d:
             self.outdir_var.set(d)
 
-    def current_args(self):
-        model = dict(MODEL_CHOICES)[self.model_var.get()]
-        lang = dict(LANG_CHOICES)[self.lang_var.get()]
-        return build_args(model=model, language=lang, prompt=self.prompt_var.get(),
-                          outdir=self.outdir_var.get(), overwrite=self.overwrite_var.get())
+    def current_opts(self):
+        """transcribe.py에 넘길 설정. 모델·언어의 '자동'은 그대로 넘겨 장치에 맞는 선택을 transcribe.py가 합니다."""
+        return {
+            "model": dict(MODEL_CHOICES)[self.model_var.get()],
+            "language": dict(LANG_CHOICES)[self.lang_var.get()],
+            "prompt": self.prompt_var.get().strip(),
+            "outdir": self.outdir_var.get().strip().strip('"').strip("'").strip(),
+            "overwrite": self.overwrite_var.get(),
+        }
 
     def start(self):
-        if self.worker and self.worker.is_alive():
+        if self.job and self.job.is_alive():
             return
         if not self.files:
             messagebox.showinfo(APP_TITLE, "먼저 파일을 추가하세요.")
             return
-        args = self.current_args()
-        self.last_outdir = Path(args.outdir) if args.outdir else self.files[0].parent / "전사결과"
-        self.cancel.clear()
+        opts = self.current_opts()
+        self.last_outdir = Path(opts["outdir"]) if opts["outdir"] else self.files[0].parent / "전사결과"
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.configure(maximum=len(self.files), value=0)
         self.status_var.set("전사 중…")
-        files = list(self.files)
-        self.worker = threading.Thread(target=run_jobs, args=(files, args, self._emit, self.cancel.is_set), daemon=True)
-        self.worker.start()
+        self.job = Job(self.files, opts, self._emit)
+        self.job.start()
 
     def stop(self):
-        if self.worker and self.worker.is_alive():
-            self.cancel.set()
+        if self.job and self.job.is_alive():
+            self.job.request_stop()
             self.stop_btn.configure(state="disabled")
             self.status_var.set("중단 요청… 현재 구간을 멈추는 중")
 
@@ -285,6 +392,8 @@ class App(tk.Tk):
                     self.status_var.set(f"{done}/{total} 완료 · 현재: {name}")
                 elif kind == "outdir":
                     self.last_outdir = Path(payload)
+                elif kind == "status":
+                    self.status_var.set(payload)
                 elif kind == "done":
                     self._finish(payload)
         except queue.Empty:
@@ -308,11 +417,11 @@ class App(tk.Tk):
             self._append_log("\n모두 완료. [결과 폴더 열기]를 누르세요.")
 
     def _on_close(self):
-        if self.worker and self.worker.is_alive():
+        if self.job and self.job.is_alive():
             if not messagebox.askyesno(APP_TITLE, "전사가 진행 중입니다. 창을 닫으면 현재 구간은 버려지고, 다음에 이어서 할 수 있습니다. 닫을까요?"):
                 return
-            self.cancel.set()
-            self.worker.join(3)   # ffmpeg 자식 프로세스가 정리될 시간
+            self.job.request_stop(hard=True)   # 엔진과 ffmpeg까지 바로 끝냄
+            self.job.thread.join(3)
         self.destroy()
 
 
