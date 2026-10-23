@@ -1,0 +1,5 @@
+# Windows/Linux에서 NVIDIA GPU를 쓸 때만 추가 설치 (약 1GB 이상):
+#   .venv\Scripts\pip install -r requirements-gpu.txt
+# faster-whisper 공식 README의 GPU 요구사항(cuBLAS·cuDNN 9, CUDA 12)에 맞춘 것입니다. 검증 필요: 드라이버 버전에 따라 다를 수 있음.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9,<10
